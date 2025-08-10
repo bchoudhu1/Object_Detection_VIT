@@ -1,200 +1,224 @@
-
+#!/usr/bin/env python3
+# refactored detector using ViT, batching, correct softmax, and safer parsing.
 #This code is under progress, is highly experimental and might contain bugs.
 #Will need further review.
 #Adapted from https://pyimagesearch.com/2020/06/22/turning-any-cnn-image-classifier-into-an-object-detector-with-keras-tensorflow-and-opencv/
+#!/usr/bin/env python3
+# refactored detector using ViT, batching, correct softmax, and safer parsing.
 # import the necessary packages
-from vit_model import MyViT  # Assuming you have the ViT model class in a file `vit_model.py`
-import json
-import torch
-import numpy as np
 import argparse
-import imutils
+import ast
+import json
 import time
+from collections import OrderedDict
 import cv2
+import imutils
+import numpy as np
+import torch
 from torchvision import transforms
 from imutils.object_detection import non_max_suppression
+from vit_model import MyViT  # import from ViT implementation
 
 
 def sliding_window(image, step, ws):
-    # slide a window across the image
-    for y in range(0, image.shape[0] - ws[1], step):
-        for x in range(0, image.shape[1] - ws[0], step):
-            # yield the current window
+    # ws = (w, h)
+    # include final positions with +1 to avoid off-by-one
+    for y in range(0, max(1, image.shape[0] - ws[1] + 1), step):
+        for x in range(0, max(1, image.shape[1] - ws[0] + 1), step):
             yield (x, y, image[y:y + ws[1], x:x + ws[0]])
 
 
 def image_pyramid(image, scale=1.5, minSize=(32, 32)):
-    # yield the original image
+    # yield the original image, then smaller ones
     yield image
-    # keep looping over the image pyramid
     while True:
-        # compute the dimensions of the next image in the pyramid
         w = int(image.shape[1] / scale)
         image = imutils.resize(image, width=w)
-        # if the resized image does not meet the supplied minimum
-        # size, then stop constructing the pyramid
         if image.shape[0] < minSize[1] or image.shape[1] < minSize[0]:
             break
-        # yield the next image in the pyramid
         yield image
 
-# construct the argument parse and parse the arguments
-ap = argparse.ArgumentParser()
-ap.add_argument("-i", "--image", required=True, help="path to the input image")
-ap.add_argument("-p", "--pretrain_path", required=True, help="path to pretrained model")  # Renamed
-ap.add_argument("-s", "--size", type=str, default="(32, 32)", help="ROI size (in pixels)")
-ap.add_argument("-c", "--min-conf", type=float, default=0.9, help="minimum probability to filter weak detections")
-ap.add_argument("-v", "--visualize", type=int, default=-1, help="whether or not to show extra visualizations for debugging")
-ap.add_argument("-l", "--class_labels", type=str, default=-1, help="Pass in as JSON")
-args = vars(ap.parse_args())
 
-# Load class names from the provided JSON file
-with open(args["class_labels"], 'r') as f:
-    class_names = json.load(f)
+def safe_load_state(model, path, device):
+    # load with map_location, handle 'module.' prefix if present
+    checkpoint = torch.load(path, map_location=device)
+    # if saved as dict with 'state_dict', unwrap
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+    # Fix keys if DataParallel used
+    if any(k.startswith("module.") for k in checkpoint.keys()):
+        new_state = OrderedDict()
+        for k, v in checkpoint.items():
+            name = k.replace("module.", "")
+            new_state[name] = v
+        checkpoint = new_state
+    model.load_state_dict(checkpoint)
 
-# initialize variables used for the object detection procedure
-WIDTH = 400
-PYR_SCALE = 1.5
-WIN_STEP = 16
-ROI_SIZE = eval(args["size"])
-INPUT_SIZE = (32, 32)  # Resize to 32x32 for ViT model input
 
-# Load the Vision Transformer (ViT) model
-print("[INFO] loading Vision Transformer model...")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-vit_model = MyViT(chw=(3, 32, 32), n_patches=7, n_blocks=2, hidden_d=128, n_heads=8, out_d=10)  # Your ViT model
-vit_model.load_state_dict(torch.load(args["pretrain_path"]))  # Use args["pretrain_path"]
-vit_model.to(device)
-vit_model.eval()
+def to_bgr(rgb_img):
+    return cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
 
-# Preprocessing transformation for ViT
-transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize((32, 32)),  # Resize to match ViT input size
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Standard ViT normalization
-])
 
-# load the input image from disk, resize it such that it has the supplied width, and then grab its dimensions
-orig = cv2.imread(args["image"])
-orig = cv2.cvtColor(orig, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
-orig = imutils.resize(orig, width=WIDTH)
-(H, W) = orig.shape[:2]
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-i", "--image", required=True, help="path to the input image")
+    ap.add_argument("-p", "--pretrain_path", required=True, help="path to pretrained model")
+    ap.add_argument("-s", "--size", type=str, default="(32, 32)", help="ROI size as tuple string, e.g. '(32, 32)'")
+    ap.add_argument("-c", "--min-conf", type=float, default=0.9, help="minimum probability to keep detection")
+    ap.add_argument("-v", "--visualize", type=int, default=-1, help="show debug windows")
+    ap.add_argument("-l", "--class_labels", type=str, required=True, help="JSON file mapping classes (list or dict)")
+    ap.add_argument("--width", type=int, default=400, help="resize image width")
+    ap.add_argument("--win-step", type=int, default=16)
+    ap.add_argument("--pyr-scale", type=float, default=1.5)
+    ap.add_argument("--batch-size", type=int, default=64)
+    args = ap.parse_args()
 
-# initialize the image pyramid
-pyramid = image_pyramid(orig, scale=PYR_SCALE, minSize=ROI_SIZE)
+    # safe parse size
+    try:
+        ROI_SIZE = tuple(ast.literal_eval(args.size))
+        assert len(ROI_SIZE) == 2
+    except Exception:
+        raise ValueError("Invalid --size. Use a tuple like '(32, 32)'")
 
-# initialize two lists, one to hold the ROIs generated from the image pyramid and sliding window,
-# and another list used to store the (x, y)-coordinates of where the ROI was in the original image
-rois = []
-locs = []
+    INPUT_SIZE = (32, 32)  # (W, H) used for cv2.resize; transforms.Resize uses (H, W)
+    WIDTH = args.width
+    PYR_SCALE = args.pyr_scale
+    WIN_STEP = args.win_step
 
-# time how long it takes to loop over the image pyramid layers and sliding window locations
-start = time.time()
+    # load class names
+    with open(args.class_labels, "r") as f:
+        class_names = json.load(f)
+    # normalize class_names to a list when possible
+    if isinstance(class_names, dict):
+        # try to convert dict keys "0","1",... to list by sorted keys
+        try:
+            keys = sorted(class_names.keys(), key=lambda k: int(k))
+            class_list = [class_names[k] for k in keys]
+            class_names = class_list
+        except Exception:
+            # keep dict as-is; we'll do str lookup later
+            pass
 
-# loop over the image pyramid
-for image in pyramid:
-    # determine the scale factor between the *original* image dimensions and the *current* layer of the pyramid
-    scale = W / float(image.shape[1])
-    
-    # for each layer of the image pyramid, loop over the sliding window locations
-    for (x, y, roiOrig) in sliding_window(image, WIN_STEP, ROI_SIZE):
-        # scale the (x, y)-coordinates of the ROI with respect to the *original* image dimensions
-        x = int(x * scale)
-        y = int(y * scale)
-        w = int(ROI_SIZE[0] * scale)
-        h = int(ROI_SIZE[1] * scale)
-        
-        # preprocess the ROI to match ViT input size
-        roi = cv2.resize(roiOrig, INPUT_SIZE)
-        roi = transform(roi)  # Apply the ViT transformation
-        roi = roi.unsqueeze(0).to(device)  # Add batch dimension and move to device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("[INFO] loading Vision Transformer model...")
+    # adjust constructor args to match your MyViT
+    vit_model = MyViT(chw=(3, 32, 32), n_patches=7, n_blocks=2, hidden_d=128, n_heads=8, out_d=10)
+    safe_load_state(vit_model, args.pretrain_path, device)
+    vit_model.to(device)
+    vit_model.eval()
 
-        # update our list of ROIs and associated coordinates
-        rois.append(roi)
-        locs.append((x, y, x + w, y + h))
-        
-        # check to see if we are visualizing each of the sliding windows in the image pyramid
-        if args["visualize"] > 0:
-            # clone the original image and then draw a bounding box surrounding the current region
-            clone = orig.copy()
-            cv2.rectangle(clone, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            # show the visualization and current ROI
-            cv2.imshow("Visualization", clone)
-            cv2.imshow("ROI", roiOrig)
-            cv2.waitKey(0)
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((INPUT_SIZE[1], INPUT_SIZE[0])),  # PIL expects (H,W)
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
 
-# show how long it took to loop over the image pyramid layers and sliding window locations
-end = time.time()
-print("[INFO] looping over pyramid/windows took {:.5f} seconds".format(end - start))
+    orig_bgr = cv2.imread(args.image)
+    if orig_bgr is None:
+        raise ValueError(f"Could not read image: {args.image}")
+    orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
+    orig_rgb = imutils.resize(orig_rgb, width=WIDTH)
+    (H, W) = orig_rgb.shape[:2]
 
-# classify each of the proposal ROIs using ViT and then show how long the classifications took
-print("[INFO] classifying ROIs...")
-start = time.time()
+    print("[INFO] building image pyramid and sliding windows...")
+    pyramid = image_pyramid(orig_rgb, scale=PYR_SCALE, minSize=ROI_SIZE)
 
-# Perform predictions using the ViT model
-preds = []
-for roi in rois:
+    rois = []
+    locs = []
+    start = time.time()
+    for image in pyramid:
+        scale = W / float(image.shape[1])
+        for (x, y, roiOrig) in sliding_window(image, WIN_STEP, ROI_SIZE):
+            # map window coords to original resized image coords
+            x0 = int(x * scale)
+            y0 = int(y * scale)
+            w = int(ROI_SIZE[0] * scale)
+            h = int(ROI_SIZE[1] * scale)
+            # clamp
+            x0 = max(0, min(x0, W - 1))
+            y0 = max(0, min(y0, H - 1))
+            w = max(1, min(w, W - x0))
+            h = max(1, min(h, H - y0))
+
+            # prepare tensor on CPU (do NOT move to device yet)
+            roi_resized = cv2.resize(roiOrig, INPUT_SIZE)  # (W,H)
+            roi_tensor = transform(roi_resized)  # C,H,W
+            rois.append(roi_tensor.unsqueeze(0))  # 1,C,H,W on CPU
+            locs.append((x0, y0, x0 + w, y0 + h))
+
+            if args.visualize > 0:
+                vis = orig_rgb.copy()
+                cv2.rectangle(vis, (x0, y0), (x0 + w, y0 + h), (0, 255, 0), 1)
+                cv2.imshow("Window (BGR)", to_bgr(vis))
+                cv2.imshow("ROI (BGR)", to_bgr(roiOrig))
+                cv2.waitKey(1)
+
+    end = time.time()
+    print(f"[INFO] pyramid/windows loop took {end - start:.4f} seconds. {len(rois)} windows.")
+
+    if len(rois) == 0:
+        print("[INFO] no candidate windows produced. Exiting.")
+        return
+
+    # batch inference with softmax -> probabilities
+    all_rois = torch.cat(rois, dim=0)
+    batch_size = args.batch_size
+    probs_list = []
+    start = time.time()
     with torch.no_grad():
-        output = vit_model(roi)  # Get prediction from ViT model
-        preds.append(output.cpu().numpy())  # Move output to CPU and append
+        for i in range(0, all_rois.size(0), batch_size):
+            batch = all_rois[i:i + batch_size].to(device)
+            logits = vit_model(batch)  # shape (B, num_classes)
+            probs = torch.softmax(logits, dim=1)  # now true probabilities
+            probs_list.append(probs.cpu())
+    probs_all = torch.cat(probs_list, dim=0).numpy()
+    end = time.time()
+    print(f"[INFO] classifying ROIs took {end - start:.4f} seconds")
 
-end = time.time()
-print("[INFO] classifying ROIs took {:.5f} seconds".format(end - start))
+    # build label -> [(box, prob), ...]
+    labels = {}
+    for i, pvec in enumerate(probs_all):
+        prob = float(pvec.max())
+        label = int(pvec.argmax())
+        if prob >= args.min_conf:
+            labels.setdefault(label, []).append((locs[i], prob))
 
-# Define a mapping from class indices to human-readable class names
+    if not labels:
+        print("[INFO] no detections above min confidence.")
+        return
 
-#Add the class labels here
-#class_names = {0: 'class_0', 1: 'class_1', 2: 'class_2', 3: 'class_3', 4: 'class_4', 5: 'class_5', 6: 'class_6', 7: 'class_7', 8: 'class_8', 9: 'class_9'}
+    # visualize per-class with NMS
+    for label, boxes_probs in labels.items():
+        print(f"[INFO] showing results for label {label}")
+        before = orig_rgb.copy()
+        for (box, prob) in boxes_probs:
+            (sx, sy, ex, ey) = box
+            cv2.rectangle(before, (sx, sy), (ex, ey), (0, 255, 0), 1)
+        cv2.imshow("Before NMS", to_bgr(before))
 
-# Decode the predictions and initialize a dictionary which maps class labels (keys) to any ROIs associated with that label (values)
-labels = {}
-for i, pred in enumerate(preds):
-    prob = pred.max()  # Get the max probability
-    label = pred.argmax()  # Get the predicted class label
-    
-    # filter out weak detections by ensuring the predicted probability is greater than the minimum probability
-    if prob >= args["min_conf"]:
-        # grab the bounding box associated with the prediction and convert the coordinates
-        box = locs[i]
-        # grab the list of predictions for the label and add the bounding box and probability to the list
-        L = labels.get(label.item(), [])
-        L.append((box, prob))
-        labels[label.item()] = L
+        boxes = np.array([bp[0] for bp in boxes_probs]).astype("int")
+        scores = np.array([bp[1] for bp in boxes_probs]).astype("float")
+        # imutils' NMS expects boxes and scores; returns kept boxes
+        pick = non_max_suppression(boxes, probs=scores) if scores.size else np.array([])
 
-# loop over the labels for each of detected objects in the image
-for label in labels.keys():
-    # clone the original image so that we can draw on it
-    print("[INFO] showing results for label {}".format(label))
-    clone = orig.copy()
+        after = orig_rgb.copy()
+        for (sx, sy, ex, ey) in pick:
+            cv2.rectangle(after, (sx, sy), (ex, ey), (0, 255, 0), 2)
+            # safe label name lookup
+            if isinstance(class_names, list) and label < len(class_names):
+                label_name = class_names[label]
+            elif isinstance(class_names, dict):
+                label_name = class_names.get(str(label), class_names.get(label, f"label_{label}"))
+            else:
+                label_name = f"label_{label}"
+            y = sy - 10 if sy - 10 > 10 else sy + 10
+            cv2.putText(after, f"{label_name} {scores.tolist()[0]:.2f}", (sx, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
-    # loop over all bounding boxes for the current label
-    for (box, prob) in labels[label]:
-        # draw the bounding box on the image
-        (startX, startY, endX, endY) = box
-        cv2.rectangle(clone, (startX, startY), (endX, endY), (0, 255, 0), 2)
+        cv2.imshow("After NMS", to_bgr(after))
+        cv2.waitKey(0)
 
-    # show the results *before* applying non-maxima suppression, then clone the image again
-    # so we can display the results *after* applying non-maxima suppression
-    cv2.imshow("Before", clone)
-    clone = orig.copy()
+if __name__ == "__main__":
+    main()
 
-    # extract the bounding boxes and associated prediction probabilities, then apply non-maxima suppression
-    boxes = np.array([p[0] for p in labels[label]])
-    proba = np.array([p[1] for p in labels[label]])
-    
-    # Apply NMS per class label
-    boxes = non_max_suppression(boxes, proba)
-
-    # loop over all bounding boxes that were kept after applying non-maxima suppression
-    for (startX, startY, endX, endY) in boxes:
-        # draw the bounding box and label on the image
-        cv2.rectangle(clone, (startX, startY), (endX, endY), (0, 255, 0), 2)
-        label_name = class_names[label]  # Get the human-readable label name
-        y = startY - 10 if startY - 10 > 10 else startY + 10
-        cv2.putText(clone, label_name, (startX, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 2)
-
-    # show the output after applying non-maxima suppression
-    cv2.imshow("After", clone)
-    cv2.waitKey(0)
